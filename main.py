@@ -19,12 +19,16 @@ import pyqtgraph as pg
 # ==========================================================
 
 class OpticalSignal:
-    def __init__(self, t, power, chirp, width):
+    def __init__(self, t, field):
         self.t = t
-        self.power = power
-        self.chirp = chirp
-        self.width = width   # pulse width parameter
-        
+        self.dt = t[1] - t[0]
+        self.field = field  # complex field
+
+    @property
+    def power(self):
+        return np.abs(self.field) ** 2
+
+
 class SignalGenerator:
 
     @staticmethod
@@ -33,75 +37,87 @@ class SignalGenerator:
         width_ps=8,
         chirp=0.0,
         window_ps=100,
-        samples=4000
+        samples=4096
     ):
         t = np.linspace(-window_ps/2, window_ps/2, samples)
-
-        power = peak_power * np.exp(-(t**2) / (2 * width_ps**2))
-
-        # linear frequency chirp
-        chirp_profile = chirp * (t / width_ps)
-
-        return OpticalSignal(t, power, chirp_profile, width_ps)
+        amplitude = np.sqrt(peak_power) * np.exp(-(t**2)/(2*width_ps**2))
+        phase = chirp * (t**2)/(2*width_ps**2)
+        field = amplitude * np.exp(1j * phase)
+        return OpticalSignal(t, field)
 
 
 class Components:
 
     @staticmethod
+    def apply_dispersion(signal, beta2, length_km):
+
+        N = len(signal.t)
+        dt = signal.dt
+
+        freq = np.fft.fftfreq(N, d=dt)
+        omega = 2 * np.pi * freq
+
+        spectrum = np.fft.fft(signal.field)
+
+        dispersion_phase = np.exp(
+            -1j * 0.5 * beta2 * length_km * omega**2
+        )
+
+        spectrum *= dispersion_phase
+        signal.field = np.fft.ifft(spectrum)
+
+        return signal
+
+    @staticmethod
     def process(comp_type, signal):
 
         if comp_type == "SMF":
+
             length_km = 50
-            alpha_db = 0.2          # attenuation
-            beta2 = 17              # ps^2/km dispersion
+            alpha_db = 0.2
+            beta2 = 17  # ps^2/km
 
-            # attenuation
-            signal.power *= 10 ** (-alpha_db * length_km / 10)
+            loss_linear = 10 ** (-alpha_db * length_km / 20)
+            signal.field *= loss_linear
 
-            # dispersion broadening
-            broaden_factor = np.sqrt(
-                1 + (beta2 * length_km / signal.width**2)**2
-            )
-
-            signal.width *= broaden_factor
-            signal.power = np.exp(-(signal.t**2) / (2 * signal.width**2))
-
-            # chirp added by dispersion
-            signal.chirp += (beta2 * length_km / signal.width**2) * signal.t
+            signal = Components.apply_dispersion(signal, beta2, length_km)
 
         elif comp_type == "DCF":
+
             length_km = 10
-            beta2 = -80
             alpha_db = 0.5
+            beta2 = -80
 
-            signal.power *= 10 ** (-alpha_db * length_km / 10)
+            loss_linear = 10 ** (-alpha_db * length_km / 20)
+            signal.field *= loss_linear
 
-            broaden_factor = np.sqrt(
-                1 + (beta2 * length_km / signal.width**2)**2
-            )
-
-            signal.width *= broaden_factor
-            signal.power = np.exp(-(signal.t**2) / (2 * signal.width**2))
-
-            signal.chirp += (beta2 * length_km / signal.width**2) * signal.t
+            signal = Components.apply_dispersion(signal, beta2, length_km)
 
         elif comp_type == "Amp":
+
             gain_db = 20
-            noise_level = 0.01
+            gain_linear = 10 ** (gain_db / 20)
+            signal.field *= gain_linear
 
-            signal.power *= 10 ** (gain_db / 10)
+            noise = 0.001 * (
+                np.random.randn(len(signal.field))
+                + 1j * np.random.randn(len(signal.field))
+            )
 
-            # ASE noise
-            signal.power += noise_level * np.random.randn(len(signal.power))
+            signal.field += noise
+
+        elif comp_type == "OSA":
+            return signal
 
         elif comp_type == "MZM":
             modulation_depth = 0.8
-            signal.power *= (1 + modulation_depth * np.sin(0.2 * signal.t))
-            signal.chirp += 0.05 * np.gradient(signal.power)
+            power = signal.power
+            power *= (1 + modulation_depth * np.sin(0.2 * signal.t))
 
         elif comp_type == "Booster":
             gain_db = 10
-            signal.power *= 10 ** (gain_db / 10)
+            gain_linear = 10 ** (gain_db / 20)
+            signal.field *= gain_linear
 
         return signal
 
@@ -115,20 +131,30 @@ class ComponentNode(QGraphicsRectItem):
         super().__init__(0, 0, 100, 50)
 
         self.name = name
-        self.connections = []   #this tracks the wires
+        self.connections = []
 
         self.setBrush(QColor("#e6f2ff"))
         self.setPen(QPen(Qt.black, 2))
 
         self.setFlags(
             QGraphicsRectItem.ItemIsMovable |
-            QGraphicsRectItem.ItemIsSelectable
+            QGraphicsRectItem.ItemIsSelectable |
+            QGraphicsRectItem.ItemSendsGeometryChanges
         )
 
         self.label = QGraphicsTextItem(name, self)
         self.label.setDefaultTextColor(Qt.black)
         self.label.setPos(25, 15)
-        
+
+    def itemChange(self, change, value):
+
+        if change == QGraphicsRectItem.ItemPositionChange:
+            for connection in self.connections:
+                connection.update_position()
+
+        return super().itemChange(change, value)
+
+
 class ConnectionLine(QGraphicsLineItem):
     def __init__(self, n1, n2):
         super().__init__()
@@ -155,7 +181,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        
+
         self.connection_items = []
         self.component_counter = 0
 
@@ -167,17 +193,11 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
 
-    # ------------------------------------------------------
-
     def _build_ui(self):
 
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-
-        # =======================
-        # PLOTS
-        # =======================
 
         plot_layout = QHBoxLayout()
 
@@ -195,20 +215,12 @@ class MainWindow(QMainWindow):
         plot_layout.addWidget(self.chirp_plot)
         main_layout.addLayout(plot_layout)
 
-        # =======================
-        # CANVAS
-        # =======================
-
         self.scene = QGraphicsScene(0, 0, 1200, 400)
         self.view = QGraphicsView(self.scene)
         self.view.setBackgroundBrush(QColor("white"))
         main_layout.addWidget(self.view)
 
         self._draw_grid()
-
-        # =======================
-        # TOOLBAR
-        # =======================
 
         toolbar = QHBoxLayout()
 
@@ -233,8 +245,6 @@ class MainWindow(QMainWindow):
 
         main_layout.addLayout(toolbar)
 
-    # ------------------------------------------------------
-
     def _draw_grid(self):
         grid = 25
         pen = QPen(QColor(230, 230, 230))
@@ -245,31 +255,22 @@ class MainWindow(QMainWindow):
         for y in range(0, 400, grid):
             self.scene.addLine(0, y, 1200, y, pen)
 
-    # ------------------------------------------------------
-
     def add_component(self, name):
 
         node = ComponentNode(name)
 
-        x_offset = 100 + (self.component_counter % 6) * 150
-        y_offset = 80 + (self.component_counter // 6) * 120
+        index = len(self.graph.nodes)
+
+        x_offset = 100 + (index % 6) * 150
+        y_offset = 80 + (index // 6) * 120
+
         node.setPos(x_offset, y_offset)
-
-        self.component_counter += 1
-
         self.scene.addItem(node)
 
-        #Store correct internal type
-        if name == "Gaussian Source":
-            comp_type = "SOURCE"
-        else:
-            comp_type = name
-
+        comp_type = "SOURCE" if name == "Gaussian Pulse" else name
         self.graph.add_node(node, type=comp_type)
 
         node.mousePressEvent = lambda event, n=node: self.node_clicked(n)
-        
-    # ------------------------------------------------------
 
     def node_clicked(self, node):
 
@@ -283,26 +284,28 @@ class MainWindow(QMainWindow):
             self.selected_node.setPen(QPen(Qt.black, 2))
             self.selected_node = None
 
-    # ------------------------------------------------------
-
     def connect_nodes(self, n1, n2):
 
-        # prevent duplicate edges
         if self.graph.has_edge(n1, n2):
+            return
+
+        if n1 == n2:
             return
 
         connection = ConnectionLine(n1, n2)
         self.scene.addItem(connection)
 
         self.connection_items.append(connection)
-
-        # store references on nodes
         n1.connections.append(connection)
         n2.connections.append(connection)
 
-        self.graph.add_edge(n1, n2)
+        # Ensure both nodes exist with attributes
+        if n1 not in self.graph:
+            return
+        if n2 not in self.graph:
+            return
 
-    # ------------------------------------------------------
+        self.graph.add_edge(n1, n2)
 
     def run_simulation(self):
 
@@ -320,19 +323,18 @@ class MainWindow(QMainWindow):
         source_found = False
 
         for node in ordered_nodes:
-            comp_type = self.graph.nodes[node]["type"]
+            node_data = self.graph.nodes[node]
+            comp_type = node_data.get("type", None)
 
-            # =========================
-            # GAUSSIAN SOURCE
-            # =========================
+            if comp_type is None:
+                continue
+
             if comp_type == "SOURCE":
-
                 signal = SignalGenerator.gaussian_pulse(
                     peak_power=1,
                     width_ps=8,
                     chirp=0.2
                 )
-
                 source_found = True
                 continue
 
@@ -348,11 +350,57 @@ class MainWindow(QMainWindow):
         self.power_plot.clear()
         self.chirp_plot.clear()
 
-        self.power_plot.plot(signal.t, signal.power)
-        self.chirp_plot.plot(signal.t, signal.chirp)
+        self.power_plot.plot(signal.t, signal.power, pen=pg.mkPen('b', width=2))
 
+        phase = np.unwrap(np.angle(signal.field))
+        chirp = np.gradient(phase, signal.dt)
 
-# ==========================================================
+        self.chirp_plot.plot(signal.t, chirp, pen=pg.mkPen('r', width=2))
+
+    def keyPressEvent(self, event):
+
+        if event.key() == Qt.Key_Delete:
+
+            for item in self.scene.selectedItems():
+
+                if isinstance(item, ComponentNode):
+                    self.delete_component(item)
+
+                elif isinstance(item, ConnectionLine):
+                    self.delete_connection(item)
+
+        else:
+            super().keyPressEvent(event)
+
+    def delete_component(self, node):
+
+        for connection in list(node.connections):
+            self.delete_connection(connection)
+
+        if node in self.graph:
+            self.graph.remove_node(node)
+
+        self.scene.removeItem(node)
+
+    def delete_connection(self, connection):
+
+        n1 = connection.n1
+        n2 = connection.n2
+
+        if self.graph.has_edge(n1, n2):
+            self.graph.remove_edge(n1, n2)
+
+        if connection in n1.connections:
+            n1.connections.remove(connection)
+
+        if connection in n2.connections:
+            n2.connections.remove(connection)
+
+        if connection in self.connection_items:
+            self.connection_items.remove(connection)
+
+        self.scene.removeItem(connection)
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
