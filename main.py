@@ -350,12 +350,12 @@ class MainWindow(QMainWindow):
         self.power_plot.clear()
         self.chirp_plot.clear()
 
-        self.power_plot.plot(signal.t, signal.power, pen=pg.mkPen('b', width=2))
+        self.power_plot.plot(signal.t, signal.power, pen=pg.mkPen('r', width=2))
 
         phase = np.unwrap(np.angle(signal.field))
         chirp = np.gradient(phase, signal.dt)
 
-        self.chirp_plot.plot(signal.t, chirp, pen=pg.mkPen('r', width=2))
+        self.chirp_plot.plot(signal.t, chirp, pen=pg.mkPen('b', width=2))
 
     def keyPressEvent(self, event):
 
